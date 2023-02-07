@@ -42,7 +42,7 @@ class Struct(object):
   def loads(self, data):
     """Parse from byte string."""
     if len(data) != self.SIZE:
-      raise ValueError('Bad struct %s size: expected=%d got=%d\n', self.__name__, len(data))
+      raise ValueError('Bad struct %s size: expected=%d got=%d' % (self.__class__.__name__, self.SIZE, len(data)))
     fmt0 = self.FMT[0]  # Byte order: '<' or '>'.
     ofs = 0
     for fmt, fname, doc in self.FIELDS:
@@ -294,7 +294,21 @@ def sector_identity(sector_idx):
   return sector_idx
 
 
-def extract(fs_filename, base_block_idx, block_size_limit, tar_filename, progressf, do_transform_sector_idx):
+MbrEntry = new_struct_class('MbrEntry', """MBR partition entry.""", (
+    ('B', 'active',       '0x00 is non-bootable, 0x80 is bootable.'),
+    ('B', 'first_head',   'First sector head.'),
+    ('B', 'first_sector', 'First sector sector. Also contains bits of track.'),
+    ('B', 'first_track',  'First sector track.'),
+    ('B', 'type',         'Partition type.'),
+    ('B', 'last_head',    'Last sector head.'),
+    ('B', 'last_sector' , 'Last sector sector. Also contains bits of track.'),
+    ('B', 'last_track',   'Last sector track.'),
+    ('L', 'first_lba',    'First sector, 0-based, LBA.'),
+    ('L', 'sector_count', 'Number of 512-byte sectors.'),
+))
+
+
+def extract(fs_filename, base_block_idx, block_size_limit, tar_filename, progressf, do_transform_sector_idx, partition):
   f = open(fs_filename, 'rb')
   try:
     def read_block(block_idx):
@@ -304,7 +318,7 @@ def extract(fs_filename, base_block_idx, block_size_limit, tar_filename, progres
         raise ValueError('Block index beyond filesystem.')
       if block_size_limit is not None and block_idx > block_size_limit:
         raise ValueError('Block index must be smaller than the size limit.')
-      block_idx2 = sector_transform(block_idx) + base_block_idx
+      block_idx2 = sector_transform(block_idx) + (base_block_idx or 0)
       f.seek(block_idx2 << BSHIFT)
       data = f.read(BSIZE)
       if len(data) != BSIZE:
@@ -483,6 +497,43 @@ def extract(fs_filename, base_block_idx, block_size_limit, tar_filename, progres
 
     sector_transform = sector_identity  # Good enough for the superblock.
     sb = None
+    if base_block_idx is None and block_size_limit is None and do_transform_sector_idx in (None, False) and partition is None:  # Detect MBR partition table, use first active partition.
+      mbr_block = read_block(0)
+      if mbr_block.endswith('\x55\xaa'):
+        partitions = [MbrEntry(buffer(mbr_block, i, 0x10)) for i in xrange(0x1be, 0x1fe, 0x10)]
+        if not [1 for p in partitions if p.active not in (0, 0x80) and (p.first_lba == 0) == (p.sector_count == 0)]:
+          partitions = [p for p in partitions if p.first_lba != 0 and p.active]
+          if partitions:
+            # No overlap.
+            if not [1 for pi in xrange(len(partitions)) for pj in xrange(pi + 1, len(partitions))
+                   if max(partitions[pi].first_lba, partitions[pj].first_lba) < min(partitions[pi].first_lba + partitions[pi].sector_count, partitions[pj].first_lba + partitions[pj].sector_count)]:
+              # Now check that partitions don't extend beyond the end of the disk.
+              f.seek(0, 2)  # Seek to EOF.
+              block_count = f.tell() >> 9
+              if not [1 for p in partitions if p.first_lba + p.sector_count > block_count]:
+                # This looks like an MBR.
+                base_block_idx, block_size_limit = partitions[0].first_lba, partitions[0].sector_count
+        partitions = None  # Save memory.
+      mbr_block = None  # Save memory.
+    elif partition is not None:
+      if partition and not (base_block_idx is None and block_size_limit is None and do_transform_sector_idx in (None, False)):
+        raise ValueError('Asking for a partition conflicts with other settings.')
+      if partition:
+        if not (1 <= partition <= 4):
+          raise ValueError('Bad partition index: %d' % partition)
+        mbr_block = read_block(0)
+        if mbr_block.endswith('\x55\xaa'):
+          partitions = [MbrEntry(buffer(mbr_block, i, 0x10)) for i in xrange(0x1be, 0x1fe, 0x10)]
+          if not [1 for p in partitions if p.active not in (0, 0x80) and (p.first_lba == 0) == (p.sector_count == 0)]:
+            p = partitions[partition - 1]
+            if p.first_lba == 0:
+              raise ValueError('Missing partition: %d' % partition)
+            base_block_idx, block_size_limit = p.first_lba, p.sector_count
+          partitions = None  # Save memory.
+        mbr_block = None  # Save memory.
+    if base_block_idx is None:
+      base_block_idx = 0
+
     sb = Superblock(read_block(SUPERI))
     # il = Interleave(sb)  # !! TODO(pts): Is this needed? It's a no-op for all our test files (with sb.s_m == sb.s_n == 1).
     if do_transform_sector_idx is None:
@@ -521,13 +572,15 @@ def main(argv):
         '--base-block-idx=<block-idx>: Of 512 bytes.\n'
         '--block-size-limit=<block-count>: Of 512 bytes.\n'
         '--[no-]transform-sector-idx: Support Coherent 2.3.43 .dsk format.\n'
+        '--partition=<idx>: Primary partition 1, 2, 3 or 4.\n'
         % (argv[0],))
     sys.exit(len(argv) < 2)
 
   i = 1
-  base_block_idx = 0
+  base_block_idx = None
   block_size_limit = None
   do_transform_sector_idx = None
+  partition = None
   while i < len(argv):
     arg = argv[i]
     i += 1
@@ -539,27 +592,27 @@ def main(argv):
     elif arg.startswith('--offset='):
       ofs = int(arg[arg.find('=') + 1:])
       if ofs & 0x1ff:
-        sys.stderr.write('fatal: offset must be a multiple of 512: %d' % ofs)
-        sys.exit(1)
+        sys.exit('fatal: offset must be a multiple of 512: %d' % ofs)
       base_block_idx = ofs >> 9
     elif arg.startswith('--base-block-idx='):  # Useful for extracting a partition.
       base_block_idx = int(arg[arg.find('=') + 1:])
     elif arg.startswith('--block-size-limit='):  # Useful for extracting a partition.
       base_block_idx = int(arg[arg.find('=') + 1:])
+    elif arg.startswith('--partition='):
+      partition = int(arg[arg.find('=') + 1:])
+      if not (0 <= partition <= 4):
+        sys.exit('fatal: bad partition index: %d' % partition)
     elif arg.startswith('--transform-sector-idx'):
       do_transfor_sector_idx = True
     elif arg.startswith('--no-transform-sector-idx'):
       do_transfor_sector_idx = False
     else:
-      sys.stderr.write('fatal: unknown flag: %s' % arg)
-      sys.exit(1)
-  if base_block_idx < 0:
-    sys.stderr.write('fatal: base block must be nonnegative: %d' % base_block_idx)
-    sys.exit(1)
+      sys.exit('fatal: unknown flag: %s' % arg)
+  if base_block_idx is not None and base_block_idx < 0:
+    sys.exit('fatal: base block must be nonnegative: %d' % base_block_idx)
 
   if i >= len(argv):
-    sys.stderr.write('fatal: missing <filesystem-image> in command line\n')
-    sys.exit(1)
+    sys.exit('fatal: missing <filesystem-image> in command line')
   fs_filename = argv[i]
   i += 1
   if i >= len(argv):
@@ -568,11 +621,10 @@ def main(argv):
     tar_filename = argv[i]
     i += 1
   if i < len(argv):
-    sys.stderr.write('fatal: too many command-line arguments\n')
-    sys.exit(1)
+    sys.exit('fatal: too many command-line arguments')
   progressf = (sys.stdout, sys.stderr)[tar_filename == '-']
 
-  extract(fs_filename, base_block_idx, block_size_limit, tar_filename, progressf, do_transform_sector_idx)
+  extract(fs_filename, base_block_idx, block_size_limit, tar_filename, progressf, do_transform_sector_idx, partition)
 
 
 if __name__ == '__main__':
