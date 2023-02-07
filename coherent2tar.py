@@ -21,6 +21,11 @@ filesystem.
 
 This program can be run as a regular user if it has permission to read the
 filesystem disk image.
+
+The Linux kernel can also mount Coherent 2.x and 3.x filesystems, but (1) it
+doesn't show device node major and minor numbers correctly; (2) it can't
+mount the Coherent 2.3.43 setup disk images (*.dsk), see
+reorder_coherent_dsk.py for converting them.
 """
 
 import array
